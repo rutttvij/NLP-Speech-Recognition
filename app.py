@@ -6,6 +6,8 @@ from nltk.tokenize import word_tokenize
 from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 import sqlite3
+import matplotlib.pyplot as plt
+import re
 
 # Download NLTK resources
 nltk.download('punkt')
@@ -34,6 +36,43 @@ def perform_nlp_tasks(text):
     sia = SentimentIntensityAnalyzer()
     sentiment = sia.polarity_scores(text)
     return tokens, pos_tags, sentiment
+
+# Function to extract search parameters from text
+def extract_search_params(text):
+    tokens = word_tokenize(text)
+    pos_tags = pos_tag(tokens)
+
+    search_params = {}
+
+    # Define patterns for extraction
+    patterns = {
+        'employee_name': re.compile(r'(employee name|name)'),
+        'department': re.compile(r'(department|dept)'),
+        'job_title': re.compile(r'(job title|title|position|role)')
+    }
+
+    for param, pattern in patterns.items():
+        for i, (word, tag) in enumerate(pos_tags):
+            if pattern.match(word.lower()):
+                if param == 'employee_name':
+                    # Check for first name and optionally last name
+                    if i + 1 < len(pos_tags):
+                        if i + 2 < len(pos_tags) and pos_tags[i + 2][1] not in ['DT', 'IN', 'TO']:
+                            search_params[param] = f"{pos_tags[i + 1][0]} {pos_tags[i + 2][0]}"
+                        else:
+                            search_params[param] = pos_tags[i + 1][0]
+                elif param == 'department':
+                    if i > 0:
+                        search_params[param] = pos_tags[i - 1][0]
+                else:
+                    # For other parameters, check if the next word exists and is not a stop word
+                    if i + 1 < len(pos_tags):
+                        if pos_tags[i + 1][1] not in ['DT', 'IN', 'TO']:  # Example of stop POS tags
+                            search_params[param] = pos_tags[i + 1][0]
+                        elif i + 2 < len(pos_tags):  # If next word is a stop word, check the following word
+                            search_params[param] = pos_tags[i + 2][0]
+
+    return search_params
 
 # Function to search employees in SQLite database based on search parameters
 def search_employees(sqlite_db_path, search_params):
@@ -73,6 +112,23 @@ def search_employees(sqlite_db_path, search_params):
     except Exception as e:
         return f"Error occurred: {e}"
     
+# Function to plot pie chart of gender distribution
+def plot_gender_distribution_pie(df):
+    gender_counts = df['Gender'].value_counts()
+    fig, ax = plt.subplots()
+    ax.pie(gender_counts, labels=gender_counts.index, autopct='%1.1f%%', startangle=90)
+    ax.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle.
+    st.pyplot(fig)
+
+# Function to plot bar chart of employee distribution by department
+def plot_employee_distribution_bar(df, category):
+    category_counts = df[category].value_counts()
+    fig, ax = plt.subplots()
+    category_counts.plot(kind='bar', ax=ax)
+    ax.set_title(f'Employee Distribution by {category}')
+    ax.set_xlabel(category)
+    ax.set_ylabel('Count')
+    st.pyplot(fig)
 
 # Streamlit frontend
 st.title("Employee Data Search")
@@ -90,7 +146,7 @@ option = st.radio("Select search method:", ("Speech Recognition", "Manual Input"
 search_params = {}
 
 if option == "Speech Recognition":
-    st.info("Say the search parameter followed by the value. For example, 'Employee Name Robert Patel', 'Department Sales', or 'Job Title Analyst'.")
+    st.info("Say the search parameter")
     if st.button("Start Recording", key="start_recording_btn"):
         result = speech_to_text()
         st.write("You said:")
@@ -99,15 +155,8 @@ if option == "Speech Recognition":
         # Perform NLP tasks
         tokens, pos_tags, sentiment = perform_nlp_tasks(result)
         
-        # Process the recognized text to extract search parameters
-        if "employee name" in result.lower():
-            search_params['employee_name'] = result.split("employee name")[-1].strip()
-        elif "department" in result.lower():
-            search_params['department'] = result.split("department")[-1].strip()
-        elif "job title" in result.lower():
-            search_params['job_title'] = result.split("job title")[-1].strip()
-        else:
-            st.error("Please say a valid search parameter followed by the value.")
+        # Extract search parameters
+        search_params = extract_search_params(result)
         
         st.write(f"Processed Search Parameters: {search_params}")
 
@@ -130,6 +179,12 @@ if option == "Speech Recognition":
             if isinstance(search_result, pd.DataFrame):
                 st.write("### Search Results")
                 st.write(search_result)  # Display all columns from the DataFrame
+                st.write("### Gender Distribution (Pie Chart)")
+                plot_gender_distribution_pie(search_result)
+                st.write("### Employee Distribution by Department (Bar Chart)")
+                plot_employee_distribution_bar(search_result, 'Department')
+                st.write("### Employee Distribution by Job Title (Bar Chart)")
+                plot_employee_distribution_bar(search_result, 'Job Title')
             else:
                 st.error(f"Failed to perform search: {search_result}")
 
@@ -161,5 +216,11 @@ elif option == "Manual Input":
             if isinstance(search_result, pd.DataFrame):
                 st.write("### Search Results")
                 st.write(search_result)  # Display all columns from the DataFrame
+                st.write("### Gender Distribution (Pie Chart)")
+                plot_gender_distribution_pie(search_result)
+                st.write("### Employee Distribution by Department (Bar Chart)")
+                plot_employee_distribution_bar(search_result, 'Department')
+                st.write("### Employee Distribution by Job Title (Bar Chart)")
+                plot_employee_distribution_bar(search_result, 'Job Title')
             else:
                 st.error(f"Failed to perform search: {search_result}")

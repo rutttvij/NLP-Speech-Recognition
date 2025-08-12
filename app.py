@@ -9,218 +9,188 @@ import sqlite3
 import matplotlib.pyplot as plt
 import re
 
-# Download NLTK resources
-nltk.download('punkt')
-nltk.download('averaged_perceptron_tagger')
-nltk.download('vader_lexicon')
+# NLTK resources (include both tagger names to avoid env mismatch)
+nltk.download('punkt', quiet=True)
+try:
+    nltk.download('averaged_perceptron_tagger_eng', quiet=True)
+except:
+    pass
+nltk.download('averaged_perceptron_tagger', quiet=True)
+nltk.download('vader_lexicon', quiet=True)
 
-# Function to convert speech to text
 def speech_to_text():
-    recognizer = sr.Recognizer()
+    r = sr.Recognizer()
     with sr.Microphone() as source:
-        st.info("Say something!")
-        audio = recognizer.listen(source)
-
+        st.info("Say your query…")
+        audio = r.listen(source)
         try:
-            text = recognizer.recognize_google(audio)
-            return text  # Return only the recognized text
-        except sr.UnknownValueError:
-            return "Sorry, I could not understand the audio."
-        except sr.RequestError as e:
-            return f"Could not request results; {e}"
+            return r.recognize_google(audio)
+        except Exception:
+            return ""
 
-# Function to perform NLP tasks
 def perform_nlp_tasks(text):
-    tokens = word_tokenize(text)
-    pos_tags = pos_tag(tokens)
+    tokens = word_tokenize(text) if text else []
+    tags = pos_tag(tokens) if tokens else []
     sia = SentimentIntensityAnalyzer()
-    sentiment = sia.polarity_scores(text)
-    return tokens, pos_tags, sentiment
+    sentiment = sia.polarity_scores(text) if text else {"neg":0,"neu":1,"pos":0,"compound":0}
+    return tokens, tags, sentiment
 
-# Function to extract search parameters from text
+# --- Robust, priority-based extractor ---
 def extract_search_params(text):
-    tokens = word_tokenize(text)
-    pos_tags = pos_tag(tokens)
+    s = text.strip()
+    s_l = s.lower()
+    sp = {}
 
-    search_params = {}
+    # 1) Department queries (explicit "department" keyword)
+    if "department" in s_l or "dept" in s_l:
+        m = re.search(r'\b(?:dept|department)\s*(?:of|in|for|:)?\s*([A-Za-z &/+\-]+)\b', s, re.I)
+        if not m:
+            m = re.search(r'\bdetails?\s+(?:of|in|from|for|at)\s+([A-Za-z &/+\-]+)\s+department\b', s, re.I)
+        if m:
+            dept = re.sub(r'\bdepartment\b', '', m.group(1), flags=re.I).strip()
+            if dept:
+                sp["department"] = dept
+                return sp  # priority satisfied
 
-    # Define patterns for extraction
-    patterns = {
-        'employee_name': re.compile(r'(employee name|name)'),
-        'department': re.compile(r'(department|dept)'),
-        'job_title': re.compile(r'(job title|title|position|role)')
-    }
+    # 2) Job title queries (role/title/position keywords)
+    if any(k in s_l for k in [" job title", "title", "position", "role", "as a ", "as an ", "with role", "with title"]):
+        mt = re.search(r'\b(?:job\s*title|title|position|role)\s*(?:of|is|=|:)?\s*([A-Za-z /&\-]+)\b', s, re.I)
+        if not mt:
+            mt = re.search(r'\b(?:as|for)\s+an?\s+([A-Za-z /&\-]+)\b', s, re.I)
+        if not mt:
+            mt = re.search(r'\bdetails?\s+(?:of|for)\s+([A-Za-z /&\-]+)\b(?:\s+(?:role|position|title))?\b', s, re.I)
+        if mt:
+            jt = mt.group(1).strip()
+            # Avoid picking up words like 'details' as title
+            if jt and jt.lower() not in {"details", "information"}:
+                sp["job_title"] = jt
+                return sp  # priority satisfied
 
-    for param, pattern in patterns.items():
-        for i, (word, tag) in enumerate(pos_tags):
-            if pattern.match(word.lower()):
-                if param == 'employee_name':
-                    # Check for first name and optionally last name
-                    if i + 1 < len(pos_tags):
-                        if i + 2 < len(pos_tags) and pos_tags[i + 2][1] not in ['DT', 'IN', 'TO']:
-                            search_params[param] = f"{pos_tags[i + 1][0]} {pos_tags[i + 2][0]}"
-                        else:
-                            search_params[param] = pos_tags[i + 1][0]
-                elif param == 'department':
-                    if i > 0:
-                        search_params[param] = pos_tags[i - 1][0]
-                else:
-                    # For other parameters, check if the next word exists and is not a stop word
-                    if i + 1 < len(pos_tags):
-                        if pos_tags[i + 1][1] not in ['DT', 'IN', 'TO']:  # Example of stop POS tags
-                            search_params[param] = pos_tags[i + 1][0]
-                        elif i + 2 < len(pos_tags):  # If next word is a stop word, check the following word
-                            search_params[param] = pos_tags[i + 2][0]
+    # 3) Otherwise treat as a person-name query: “…details of Robert Patel”
+    m = re.search(r'(?:details?|info(?:rmation)?|profile|records?)\s+of\s+([A-Za-z][A-Za-z\'\-]*(?:\s+[A-Za-z][A-Za-z\'\-]*){0,3})', s, re.I)
+    if m:
+        sp["employee_name"] = m.group(1).strip()
+        return sp
 
-    return search_params
-
-# Function to search employees in SQLite database based on search parameters
-def search_employees(sqlite_db_path, search_params):
-    try:
-        # Connect to SQLite database
-        conn = sqlite3.connect(sqlite_db_path)
-
-        # Build SQL query dynamically based on search parameters
-        query = "SELECT * FROM employees WHERE 1=1"
-        params = []
-        
-        if 'employee_name' in search_params and search_params['employee_name']:
-            query += " AND [Full Name] LIKE ?"
-            params.append(f"%{search_params['employee_name']}%")
-        
-        if 'department' in search_params and search_params['department']:
-            query += " AND Department LIKE ?"
-            params.append(f"%{search_params['department']}%")
-        
-        if 'job_title' in search_params and search_params['job_title']:
-            query += " AND [Job Title] LIKE ?"
-            params.append(f"%{search_params['job_title']}%")
-        
-        # Execute SQL query
-        st.write(f"Executing SQL query: {query}")
-        st.write(f"With parameters: {params}")  
-        if params:
-            df = pd.read_sql(query, conn, params=params)
+    # 3b) Fallback: longest proper-noun span
+    tokens = word_tokenize(s)
+    tags = pos_tag(tokens)
+    best, cur = [], []
+    for w, t in tags:
+        if t in {"NNP", "NNPS"}:
+            cur.append(w)
         else:
-            df = pd.read_sql(query, conn)
+            if len(cur) > len(best): best = cur
+            cur = []
+    if len(cur) > len(best): best = cur
+    name = " ".join(best).strip()
+    if name:
+        sp["employee_name"] = name
 
-        # Close connection
-        conn.close()
+    return sp
 
-        return df
+def search_employees(db_path, sp):
+    if not any(sp.get(k) for k in ("employee_name","department","job_title")):
+        st.warning("Please specify a name, department, or job title.")
+        return pd.DataFrame()
 
-    except Exception as e:
-        return f"Error occurred: {e}"
-    
-# Function to plot pie chart of gender distribution
+    conn = sqlite3.connect(db_path)
+    q = "SELECT * FROM employees WHERE 1=1"
+    p = []
+    if sp.get("employee_name"):
+        q += " AND [Full Name] LIKE ? COLLATE NOCASE"
+        p.append(f"%{sp['employee_name']}%")
+    if sp.get("department"):
+        q += " AND Department LIKE ? COLLATE NOCASE"
+        p.append(f"%{sp['department']}%")
+    if sp.get("job_title"):
+        q += " AND [Job Title] LIKE ? COLLATE NOCASE"
+        p.append(f"%{sp['job_title']}%")
+    df = pd.read_sql(q, conn, params=p)
+    conn.close()
+    return df
+
 def plot_gender_distribution_pie(df):
-    gender_counts = df['Gender'].value_counts()
+    if df.empty or 'Gender' not in df.columns:
+        st.info("No gender data to plot.")
+        return
+    counts = df['Gender'].value_counts()
     fig, ax = plt.subplots()
-    ax.pie(gender_counts, labels=gender_counts.index, autopct='%1.1f%%', startangle=90)
-    ax.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle.
+    ax.pie(counts, labels=counts.index, autopct='%1.1f%%', startangle=90)
+    ax.axis('equal')
     st.pyplot(fig)
 
-# Function to plot bar chart of employee distribution by department
 def plot_employee_distribution_bar(df, category):
-    category_counts = df[category].value_counts()
+    if df.empty or category not in df.columns:
+        st.info(f"No {category} data to plot.")
+        return
+    counts = df[category].value_counts()
     fig, ax = plt.subplots()
-    category_counts.plot(kind='bar', ax=ax)
+    counts.plot(kind='bar', ax=ax)
     ax.set_title(f'Employee Distribution by {category}')
     ax.set_xlabel(category)
     ax.set_ylabel('Count')
     st.pyplot(fig)
 
-# Streamlit frontend
 st.title("Employee Data Search")
-
-# Placeholder for speech recognition result
-result = ""
-
-# Search section
 st.header("Search")
-
-# Option to use speech recognition or manual input
-option = st.radio("Select search method:", ("Speech Recognition", "Manual Input"))
-
-# Define search parameters
-search_params = {}
+option = st.radio("Select search method:", ("Speech Recognition","Manual Input"))
+db_path = '/Users/rutvijjadhav/Downloads/employee_data.db'
 
 if option == "Speech Recognition":
-    st.info("Say the search parameter")
-    if st.button("Start Recording", key="start_recording_btn"):
-        result = speech_to_text()
-        st.write("You said:")
-        st.success(result)
-        
-        # Perform NLP tasks
-        tokens, pos_tags, sentiment = perform_nlp_tasks(result)
-        
-        # Extract search parameters
-        search_params = extract_search_params(result)
-        
-        st.write(f"Processed Search Parameters: {search_params}")
+    if st.button("Start Recording"):
+        query_text = speech_to_text()
+        st.write("You said:"); st.success(query_text if query_text else "(empty)")
+        tokens, tags, sentiment = perform_nlp_tasks(query_text)
+        sp = extract_search_params(query_text)
+        st.caption(f"Extracted filters → {sp}")  # helpful debug
+        df = search_employees(db_path, sp)
 
-        # Directly perform the search after processing the speech input
-        sqlite_db_path = '/Users/rutvijjadhav/Downloads/employee_data.db'  # Update with your database path
-        search_result = search_employees(sqlite_db_path, search_params)
-        
-        # Display results in split columns
         col1, col2 = st.columns(2)
         with col1:
             st.write("### NLP Tasks Results")
             st.write("Tokens:", tokens)
-            st.write("POS Tags:", pos_tags)
+            st.write("POS Tags:", tags)
             st.write("Sentiment Analysis:", sentiment)
-        
-        # Add a Streamlit divider for separation
         st.divider()
-        
         with col2:
-            if isinstance(search_result, pd.DataFrame):
+            if not df.empty:
                 st.write("### Search Results")
-                st.write(search_result)  # Display all columns from the DataFrame
+                st.write(df)
                 st.write("### Gender Distribution (Pie Chart)")
-                plot_gender_distribution_pie(search_result)
+                plot_gender_distribution_pie(df)
                 st.write("### Employee Distribution by Department (Bar Chart)")
-                plot_employee_distribution_bar(search_result, 'Department')
+                plot_employee_distribution_bar(df, 'Department')
                 st.write("### Employee Distribution by Job Title (Bar Chart)")
-                plot_employee_distribution_bar(search_result, 'Job Title')
+                plot_employee_distribution_bar(df, 'Job Title')
             else:
-                st.error(f"Failed to perform search: {search_result}")
+                st.warning("No matching results.")
+else:
+    sp = {}
+    sp['employee_name'] = st.text_input("Employee Name:")
+    sp['department']   = st.text_input("Department:")
+    sp['job_title']    = st.text_input("Job Title:")
+    if st.button("Search"):
+        st.caption(f"Extracted filters → { {k:v for k,v in sp.items() if v} }")
+        tokens, tags, sentiment = ([], [], {"neg":0,"neu":1,"pos":0,"compound":0})
+        df = search_employees(db_path, sp)
 
-elif option == "Manual Input":
-    search_params['employee_name'] = st.text_input("Employee Name:")
-    search_params['department'] = st.text_input("Department:")
-    search_params['job_title'] = st.text_input("Job Title:")
-
-    # SQLite database path
-    sqlite_db_path = '/Users/rutvijjadhav/Downloads/employee_data.db'  # Update with your database path
-
-    # Search button for manual input
-    if st.button("Search", key="search_btn"):
-        st.write(f"Final Search Parameters: {search_params}")
-        search_result = search_employees(sqlite_db_path, search_params)
-        
-        # Display results in split columns
         col1, col2 = st.columns(2)
         with col1:
             st.write("### NLP Tasks Results")
-            st.write("Tokens: N/A (Manual input selected)")
-            st.write("POS Tags: N/A (Manual input selected)")
-            st.write("Sentiment Analysis: N/A (Manual input selected)")
-        
-        # Add a Streamlit divider for separation
+            st.write("Tokens: N/A (Manual)")
+            st.write("POS Tags: N/A (Manual)")
+            st.write("Sentiment Analysis:", sentiment)
         st.divider()
-        
         with col2:
-            if isinstance(search_result, pd.DataFrame):
+            if not df.empty:
                 st.write("### Search Results")
-                st.write(search_result)  # Display all columns from the DataFrame
+                st.write(df)
                 st.write("### Gender Distribution (Pie Chart)")
-                plot_gender_distribution_pie(search_result)
+                plot_gender_distribution_pie(df)
                 st.write("### Employee Distribution by Department (Bar Chart)")
-                plot_employee_distribution_bar(search_result, 'Department')
+                plot_employee_distribution_bar(df, 'Department')
                 st.write("### Employee Distribution by Job Title (Bar Chart)")
-                plot_employee_distribution_bar(search_result, 'Job Title')
+                plot_employee_distribution_bar(df, 'Job Title')
             else:
-                st.error(f"Failed to perform search: {search_result}")
+                st.warning("No matching results.")
